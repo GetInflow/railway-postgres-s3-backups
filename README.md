@@ -43,6 +43,6 @@ A simple Bun application to backup your PostgreSQL database to S3. Runs a single
 
 - `PG_VERSION` - Specify a custom PostgreSQL version to override the default version set in the Dockerfile.
 
-## Notes for Postgres 17
+## Notes for PostgreSQL versions
 
-If backing up a Postgres 17 database imported from Postgres 16, set `PG_VERSION=17`.
+Set `PG_VERSION` to the major version of the database you are backing up, for example `17` or `18`. The Docker image uses the matching official `postgres:<PG_VERSION>-alpine` client tools so newer versions do not depend on Alpine package availability.
