@@ -31,6 +31,8 @@ Set up Railway Cron to trigger this service on a schedule. For example, a cron e
 
 **Discord notifications (optional):** Set `DISCORD_WEBHOOK_URL` to receive embed notifications in a Discord channel. On success, you'll get a green embed with the backup filename, size, and timestamp. On failure, you'll receive a red embed with the error message. Create a webhook in your Discord server under Server Settings → Integrations → Webhooks.
 
+**Restores:** This repo includes a separate manual restore command, `bun run restore`, intended for a second on-demand Railway service. Create a fresh Railway Postgres database, configure `TARGET_DATABASE_URL`, `RESTORE_ENABLED=true`, `RESTORE_CONFIRM_TARGET_IS_DISPOSABLE=true`, and either `RESTORE_S3_KEY` or `RESTORE_LATEST=true`, then trigger the restore service manually.
+
 ## Why Deploy Postgres S3 Backups on Railway?
 
 Railway is a singular platform to deploy your infrastructure stack. Railway will host your infrastructure so you don't have to deal with configuration, while allowing you to vertically and horizontally scale it.

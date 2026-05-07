@@ -9,7 +9,8 @@
     "main": "src/index.ts",
     "scripts": {
         "start": "bun run src/index.ts",
-        "build": "bun build ./src/index.ts --outdir=./dist --target=node",
+        "restore": "bun run src/restore.ts",
+        "build": "bun build ./src/index.ts ./src/restore.ts --outdir=./dist --target=node",
         "typecheck": "bun run build",
         "fmt": "oxfmt",
         "fmt:check": "oxfmt --check"

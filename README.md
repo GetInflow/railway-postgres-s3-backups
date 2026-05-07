@@ -39,6 +39,16 @@ A simple Bun application to backup your PostgreSQL database to S3. Runs a single
 
 - `DISCORD_WEBHOOK_URL` - Optional Discord webhook URL for backup success/failure notifications.
 
+## Restoring Backups
+
+This repo also includes a manual restore entrypoint for restoring these backups into a fresh PostgreSQL database:
+
+```bash
+bun run restore
+```
+
+Use it as a separate, manually triggered Railway service with `TARGET_DATABASE_URL`, `RESTORE_ENABLED=true`, `RESTORE_CONFIRM_TARGET_IS_DISPOSABLE=true`, and either `RESTORE_S3_KEY` or `RESTORE_LATEST=true`. See [RESTORE.md](./RESTORE.md) for the full restore runbook.
+
 - `BUN_VERSION` - Specify a custom Bun version to override the default version set in the Dockerfile.
 
 - `PG_VERSION` - Specify a custom PostgreSQL version to override the default version set in the Dockerfile.

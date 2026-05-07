@@ -1,4 +1,3 @@
-import { env } from "./env.js";
 import { filesize } from "filesize";
 
 export type BackupSuccessInfo = {
@@ -8,9 +7,15 @@ export type BackupSuccessInfo = {
 
 export const sendDiscordNotification = async (
     message: string,
-    options?: { isError?: boolean; backup?: BackupSuccessInfo },
+    options?: {
+        isError?: boolean;
+        backup?: BackupSuccessInfo;
+        webhookUrl?: string;
+        errorTitle?: string;
+    },
 ) => {
-    if (!env.DISCORD_WEBHOOK_URL) return;
+    const webhookUrl = options?.webhookUrl ?? process.env.DISCORD_WEBHOOK_URL;
+    if (!webhookUrl) return;
 
     try {
         let body: { content?: string; embeds?: object[] };
@@ -46,7 +51,7 @@ export const sendDiscordNotification = async (
             body = {
                 embeds: [
                     {
-                        title: "❌ Backup Failed",
+                        title: options.errorTitle ?? "❌ Backup Failed",
                         color: 0xef4444,
                         description: message,
                         timestamp: new Date().toISOString(),
@@ -57,7 +62,7 @@ export const sendDiscordNotification = async (
             body = { content: message };
         }
 
-        await fetch(env.DISCORD_WEBHOOK_URL, {
+        await fetch(webhookUrl, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(body),
