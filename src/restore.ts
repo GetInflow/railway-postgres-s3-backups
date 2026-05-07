@@ -255,27 +255,58 @@ const restoreFromS3 = async (client: S3Client, backup: BackupObject) => {
         env: process.env,
     });
 
+    let restoreStdout = "";
+    let restoreStderr = "";
+    const captureLimit = 20_000;
+    const capture = (current: string, chunk: string) =>
+        (current + chunk).slice(Math.max(0, current.length + chunk.length - captureLimit));
+
     pgRestore.stdout.setEncoding("utf8");
     pgRestore.stderr.setEncoding("utf8");
-    pgRestore.stdout.on("data", (chunk: string) => process.stdout.write(chunk));
-    pgRestore.stderr.on("data", (chunk: string) => process.stderr.write(chunk));
-
-    const restoreExit = new Promise<void>((resolve, reject) => {
-        pgRestore.once("error", reject);
-        pgRestore.once("close", (code) => {
-            if (code === 0) {
-                resolve();
-                return;
-            }
-            reject(new Error(`pg_restore exited with code ${code}`));
-        });
+    pgRestore.stdout.on("data", (chunk: string) => {
+        restoreStdout = capture(restoreStdout, chunk);
+        process.stdout.write(chunk);
+    });
+    pgRestore.stderr.on("data", (chunk: string) => {
+        restoreStderr = capture(restoreStderr, chunk);
+        process.stderr.write(chunk);
     });
 
+    const restoreExit = new Promise<{ code: number | null; signal: string | null }>(
+        (resolve, reject) => {
+            pgRestore.once("error", reject);
+            pgRestore.once("close", (code, signal) => resolve({ code, signal }));
+        },
+    );
+
+    let streamError: unknown;
     try {
-        await Promise.all([pipeline(body, createGunzip(), pgRestore.stdin), restoreExit]);
+        await pipeline(body, createGunzip(), pgRestore.stdin);
     } catch (error) {
-        pgRestore.kill();
-        throw error;
+        streamError = error;
+        if ((error as { code?: string }).code !== "EPIPE") {
+            pgRestore.kill();
+        }
+    }
+
+    const exit = await restoreExit;
+
+    if (exit.code !== 0) {
+        const streamMessage =
+            streamError instanceof Error ? `\nStream error: ${streamError.message}` : "";
+        const stderrMessage = restoreStderr.trimEnd()
+            ? `\npg_restore stderr:\n${restoreStderr.trimEnd()}`
+            : "";
+        const stdoutMessage = restoreStdout.trimEnd()
+            ? `\npg_restore stdout:\n${restoreStdout.trimEnd()}`
+            : "";
+        throw new Error(
+            `pg_restore failed with exit code ${exit.code}${exit.signal ? ` signal ${exit.signal}` : ""}.${streamMessage}${stderrMessage}${stdoutMessage}`,
+        );
+    }
+
+    if (streamError) {
+        throw streamError;
     }
 
     const elapsedSeconds = Math.round((Date.now() - startedAt) / 1000);
