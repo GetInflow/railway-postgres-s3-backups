@@ -306,7 +306,13 @@ const restoreFromS3 = async (client: S3Client, backup: BackupObject) => {
     }
 
     if (streamError) {
-        throw streamError;
+        if ((streamError as { code?: string }).code === "EPIPE") {
+            console.warn(
+                "Restore stream ended with EPIPE after pg_restore exited successfully; treating it as success.",
+            );
+        } else {
+            throw streamError;
+        }
     }
 
     const elapsedSeconds = Math.round((Date.now() - startedAt) / 1000);
