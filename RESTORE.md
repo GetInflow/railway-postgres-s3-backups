@@ -2,13 +2,13 @@
 
 This repo can run a second, manual Railway service that restores backups created by the backup service.
 
-The backup service currently writes gzip-compressed tar archives:
+The backup service writes directly compressed PostgreSQL custom-format archives:
 
 ```text
-backup-YYYY-MM-DDTHH-MM-SS-sssZ.tar.gz
+backup-YYYY-MM-DDTHH-MM-SS-sssZ.dump
 ```
 
-The restore service streams the selected S3 object through gzip into `pg_restore` and restores it into a fresh PostgreSQL database.
+The restore service streams the selected S3 object directly into `pg_restore` and restores it into a fresh PostgreSQL database. Legacy gzip-compressed `.tar.gz` backups remain supported during migration.
 
 ## Recommended Railway setup
 
@@ -57,7 +57,7 @@ S3_FORCE_PATH_STYLE=false
 Preferred: restore an exact S3 key.
 
 ```env
-RESTORE_S3_KEY=backups/backup-2026-05-07T12-00-00-000Z.tar.gz
+RESTORE_S3_KEY=backups/backup-2026-05-07T12-00-00-000Z.dump
 ```
 
 Or restore the newest matching backup:
@@ -68,7 +68,7 @@ BACKUP_FILE_PREFIX=backup
 BUCKET_SUBFOLDER=backups
 ```
 
-Exact `RESTORE_S3_KEY` is safer because it avoids accidentally restoring a newer/older backup than intended.
+Exact `RESTORE_S3_KEY` is safer because it avoids accidentally restoring a newer/older backup than intended. `RESTORE_LATEST=true` considers both current `.dump` files and legacy `.tar.gz` files, then selects the newest matching object.
 
 ## Optional environment variables
 
@@ -88,12 +88,6 @@ Dry-run the restore plan without mutating the database:
 
 ```env
 RESTORE_PLAN_ONLY=true
-```
-
-Send Discord notifications:
-
-```env
-DISCORD_WEBHOOK_URL=...
 ```
 
 Disable the empty-target check only for advanced/manual recovery work:
@@ -132,19 +126,20 @@ RESTORE_REQUIRE_EMPTY=false
 
 ## Restore implementation
 
-Equivalent command:
+Equivalent command for current custom-format backups:
 
 ```bash
-gzip -dc backup.tar.gz | pg_restore \
+pg_restore \
   --exit-on-error \
   --dbname="$TARGET_DATABASE_URL" \
-  --format=tar \
+  --format=custom \
   --no-owner \
-  --no-privileges
+  --no-privileges \
+  backup.dump
 ```
 
-The service streams from S3 rather than downloading the full backup to local disk.
+The service streams from S3 rather than downloading the full backup to local disk. For legacy backups it retains the previous `gzip -dc backup.tar.gz | pg_restore --format=tar ...` path.
 
 ## Performance note
 
-The current backup format is gzip-compressed tar, so `pg_restore --jobs=N` parallel restore is not available. If faster restores become important, add a future backup mode using custom or directory format.
+Custom format supports `pg_restore --jobs=N`, but PostgreSQL requires the input to be a regular file rather than a stream. The current restore service remains single-threaded to avoid storing the archive locally. If recovery speed becomes more important, download the compressed `.dump` to temporary disk and pass that file to `pg_restore --jobs=N`.

@@ -1,6 +1,6 @@
 # Postgres S3 Backups
 
-A simple Bun application to backup your PostgreSQL database to S3. Runs a single backup on startup and exits—schedule it via your platform's cron or scheduler (e.g. Railway Cron).
+A simple Bun application to back up your PostgreSQL database to S3. It writes a directly compressed PostgreSQL custom-format archive, runs a single backup on startup, and exits—schedule it via your platform's cron or scheduler (e.g. Railway Cron).
 
 [![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/postgres-s3-backup?referralCode=5tCsuk&utm_medium=integration&utm_source=template&utm_campaign=generic)
 
@@ -35,9 +35,9 @@ A simple Bun application to backup your PostgreSQL database to S3. Runs a single
 
 - `BACKUP_OPTIONS` - Add any valid pg_dump option, supported pg_dump options can be found [here](https://www.postgresql.org/docs/current/app-pgdump.html). Example: `--exclude-table=pattern`
 
-- `MAX_BACKUPS` - Maximum number of backups to keep in S3. Oldest backups are deleted when exceeded. 0 = unlimited. Default `0`.
+- `BACKUP_COMPRESSION` - Compression method and level for the custom-format archive. Default `gzip:6`. Examples supported by current PostgreSQL clients include `gzip:6`, `lz4`, and `zstd:3`.
 
-- `DISCORD_WEBHOOK_URL` - Optional Discord webhook URL for backup success/failure notifications.
+- `MAX_BACKUPS` - Maximum number of backups to keep in S3. Oldest backups are deleted when exceeded. 0 = unlimited. Default `10`.
 
 ## Restoring Backups
 

@@ -26,6 +26,4 @@ COPY --from=build /app/src ./src
 COPY --from=build /app/tsconfig.json ./
 
 ENTRYPOINT []
-CMD pg_isready --dbname="$DATABASE_URL" && \
-    pg_dump --version && \
-    bun run src/index.ts
+CMD ["bun", "run", "src/index.ts"]

@@ -62,9 +62,4 @@ export const restoreEnv = envsafe({
         desc: "Print selected backup and target preflight, then exit without changing the database.",
         default: false,
     }),
-    DISCORD_WEBHOOK_URL: str({
-        desc: "Optional Discord webhook URL for restore success/failure notifications.",
-        default: "",
-        allowEmpty: true,
-    }),
 });
