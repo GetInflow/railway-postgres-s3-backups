@@ -120,15 +120,37 @@ const uploadToS3 = async ({
 
 const sleep = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
-const connectionEnv = (): NodeJS.ProcessEnv => ({
-    ...process.env,
-    PGDATABASE: env.DATABASE_URL,
-    PGCONNECT_TIMEOUT: process.env.PGCONNECT_TIMEOUT || "15",
-    PGKEEPALIVES: process.env.PGKEEPALIVES || "1",
-    PGKEEPALIVESIDLE: process.env.PGKEEPALIVESIDLE || "60",
-    PGKEEPALIVESINTERVAL: process.env.PGKEEPALIVESINTERVAL || "15",
-    PGKEEPALIVESCOUNT: process.env.PGKEEPALIVESCOUNT || "4",
-});
+const connectionConfig = (): { databaseUrl: string; env: NodeJS.ProcessEnv } => {
+    let databaseUrl: URL;
+    try {
+        databaseUrl = new URL(env.DATABASE_URL);
+    } catch {
+        throw new Error("DATABASE_URL must be a valid PostgreSQL connection URL.");
+    }
+
+    if (databaseUrl.protocol !== "postgresql:" && databaseUrl.protocol !== "postgres:") {
+        throw new Error("DATABASE_URL must use the postgresql:// or postgres:// protocol.");
+    }
+
+    const username = decodeURIComponent(databaseUrl.username);
+    const password = decodeURIComponent(databaseUrl.password);
+    databaseUrl.username = "";
+    databaseUrl.password = "";
+
+    return {
+        databaseUrl: databaseUrl.toString(),
+        env: {
+            ...process.env,
+            PGUSER: username,
+            PGPASSWORD: password,
+            PGCONNECT_TIMEOUT: process.env.PGCONNECT_TIMEOUT || "15",
+            PGKEEPALIVES: process.env.PGKEEPALIVES || "1",
+            PGKEEPALIVESIDLE: process.env.PGKEEPALIVESIDLE || "60",
+            PGKEEPALIVESINTERVAL: process.env.PGKEEPALIVESINTERVAL || "15",
+            PGKEEPALIVESCOUNT: process.env.PGKEEPALIVESCOUNT || "4",
+        },
+    };
+};
 
 const runCommand = async (
     command: string,
@@ -160,7 +182,7 @@ const runCommand = async (
                 resolve({ stdout, stderr });
                 return;
             }
-            const detail = stderr.trimEnd() || "No error output was produced.";
+            const detail = stderr.trimEnd() || stdout.trimEnd() || "No error output was produced.";
             reject(
                 new Error(
                     `${command} failed with exit code ${code}${signal ? ` (signal ${signal})` : ""}: ${detail}`,
@@ -227,20 +249,25 @@ const removeIfPresent = (filePath: string) => rm(filePath, { force: true });
 
 const dumpAttempt = async (filePath: string) => {
     await removeIfPresent(filePath);
+    const connection = connectionConfig();
 
     console.log("Checking database readiness...");
-    await runCommand("pg_isready", ["--timeout=10"], { env: connectionEnv() });
+    await runCommand("pg_isready", ["--timeout=10", `--dbname=${connection.databaseUrl}`], {
+        env: connection.env,
+        captureStdout: true,
+    });
 
     console.log("Dumping DB to file...");
     await runCommand(
         "pg_dump",
         [
             ...parseBackupOptions(env.BACKUP_OPTIONS),
+            `--dbname=${connection.databaseUrl}`,
             "--format=custom",
             `--compress=${env.BACKUP_COMPRESSION}`,
             `--file=${filePath}`,
         ],
-        { env: connectionEnv() },
+        { env: connection.env },
     );
 
     console.log("Validating backup archive...");
