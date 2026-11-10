@@ -11,11 +11,13 @@ import { pipeline } from "stream/promises";
 import { Readable } from "stream";
 import { filesize } from "filesize";
 
-import { sendDiscordNotification } from "./discord.js";
 import { restoreEnv as env } from "./restore-env.js";
+
+type BackupFormat = "custom" | "legacy-tar-gzip";
 
 type BackupObject = {
     key: string;
+    format: BackupFormat;
     size?: number;
     lastModified?: Date;
 };
@@ -44,6 +46,12 @@ const parseCsv = (value: string) =>
 const backupPrefix = () => {
     const prefix = `${env.BACKUP_FILE_PREFIX}-`;
     return env.BUCKET_SUBFOLDER ? `${env.BUCKET_SUBFOLDER}/${prefix}` : prefix;
+};
+
+const backupFormat = (key: string): BackupFormat | undefined => {
+    if (key.endsWith(".dump")) return "custom";
+    if (key.endsWith(".tar.gz")) return "legacy-tar-gzip";
+    return undefined;
 };
 
 const quoteIdentifier = (identifier: string) => `"${identifier.replace(/"/g, '""')}"`;
@@ -125,11 +133,16 @@ const psqlPrint = async (label: string, query: string) => {
 
 const selectBackup = async (client: S3Client): Promise<BackupObject> => {
     if (env.RESTORE_S3_KEY) {
+        const format = backupFormat(env.RESTORE_S3_KEY);
+        if (!format) {
+            throw new Error("RESTORE_S3_KEY must identify a .dump or legacy .tar.gz backup.");
+        }
         const response = await client.send(
             new HeadObjectCommand({ Bucket: env.S3_BUCKET, Key: env.RESTORE_S3_KEY }),
         );
         return {
             key: env.RESTORE_S3_KEY,
+            format,
             size: response.ContentLength,
             lastModified: response.LastModified,
         };
@@ -154,8 +167,14 @@ const selectBackup = async (client: S3Client): Promise<BackupObject> => {
 
         for (const item of response.Contents ?? []) {
             if (!item.Key) continue;
-            if (!item.Key.endsWith(".tar.gz")) continue;
-            objects.push({ key: item.Key, size: item.Size, lastModified: item.LastModified });
+            const format = backupFormat(item.Key);
+            if (!format) continue;
+            objects.push({
+                key: item.Key,
+                format,
+                size: item.Size,
+                lastModified: item.LastModified,
+            });
         }
 
         continuationToken = response.NextContinuationToken;
@@ -165,7 +184,7 @@ const selectBackup = async (client: S3Client): Promise<BackupObject> => {
 
     const latest = objects[0];
     if (!latest) {
-        throw new Error(`No .tar.gz backups found in s3://${env.S3_BUCKET}/${prefix}`);
+        throw new Error(`No .dump or .tar.gz backups found in s3://${env.S3_BUCKET}/${prefix}`);
     }
 
     return latest;
@@ -238,10 +257,11 @@ const restoreFromS3 = async (client: S3Client, backup: BackupObject) => {
     );
     const body = toReadable(object.Body);
 
+    const pgRestoreFormat = backup.format === "custom" ? "custom" : "tar";
     const args = [
         "--exit-on-error",
         `--dbname=${env.TARGET_DATABASE_URL}`,
-        "--format=tar",
+        `--format=${pgRestoreFormat}`,
         "--no-owner",
         "--no-privileges",
     ];
@@ -281,7 +301,11 @@ const restoreFromS3 = async (client: S3Client, backup: BackupObject) => {
 
     let streamError: unknown;
     try {
-        await pipeline(body, createGunzip(), pgRestore.stdin);
+        if (backup.format === "custom") {
+            await pipeline(body, pgRestore.stdin);
+        } else {
+            await pipeline(body, createGunzip(), pgRestore.stdin);
+        }
     } catch (error) {
         streamError = error;
         if ((error as { code?: string }).code !== "EPIPE") {
@@ -322,6 +346,7 @@ const restoreFromS3 = async (client: S3Client, backup: BackupObject) => {
 const preflight = async (backup: BackupObject) => {
     console.log("Restore preflight");
     console.log(`Selected backup key: ${backup.key}`);
+    console.log(`Selected backup format: ${backup.format}`);
     if (backup.size !== undefined) console.log(`Selected backup size: ${filesize(backup.size)}`);
     if (backup.lastModified)
         console.log(`Selected backup last modified: ${backup.lastModified.toISOString()}`);
@@ -378,18 +403,11 @@ const main = async () => {
     await createExtensions();
     await restoreFromS3(client, backup);
     await verify();
-
-    await sendDiscordNotification(`✅ Restore complete: \`${backup.key}\``);
 };
 
 try {
     await main();
 } catch (error) {
     console.error("Error while running restore:", error);
-    const message = error instanceof Error ? error.message : String(error);
-    await sendDiscordNotification(`❌ Restore failed: ${message}`, {
-        isError: true,
-        errorTitle: "❌ Restore Failed",
-    });
     process.exit(1);
 }

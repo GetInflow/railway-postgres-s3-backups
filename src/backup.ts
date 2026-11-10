@@ -1,4 +1,4 @@
-import { exec, execSync } from "child_process";
+import { spawn } from "child_process";
 import {
     S3Client,
     S3ClientConfig,
@@ -7,7 +7,8 @@ import {
     DeleteObjectsCommand,
 } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
-import { createReadStream, unlink, statSync } from "fs";
+import { createReadStream, statSync } from "fs";
+import { rm } from "fs/promises";
 import { filesize } from "filesize";
 import path from "path";
 import os from "os";
@@ -117,60 +118,163 @@ const uploadToS3 = async ({
     }
 };
 
-const dumpToFile = async (filePath: string) => {
-    console.log("Dumping DB to file...");
+const sleep = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
-    await new Promise((resolve, reject) => {
-        exec(
-            `pg_dump --dbname=${env.DATABASE_URL} --format=tar ${env.BACKUP_OPTIONS} | gzip > ${filePath}`,
-            (error, stdout, stderr) => {
-                if (error) {
-                    reject({ error: error, stderr: stderr.trimEnd() });
-                    return;
-                }
+const connectionEnv = (): NodeJS.ProcessEnv => ({
+    ...process.env,
+    PGDATABASE: env.DATABASE_URL,
+    PGCONNECT_TIMEOUT: process.env.PGCONNECT_TIMEOUT || "15",
+    PGKEEPALIVES: process.env.PGKEEPALIVES || "1",
+    PGKEEPALIVESIDLE: process.env.PGKEEPALIVESIDLE || "60",
+    PGKEEPALIVESINTERVAL: process.env.PGKEEPALIVESINTERVAL || "15",
+    PGKEEPALIVESCOUNT: process.env.PGKEEPALIVESCOUNT || "4",
+});
 
-                // check if archive is valid and contains data
-                const isValidArchive =
-                    execSync(`gzip -cd ${filePath} | head -c1`).length == 1 ? true : false;
-                if (isValidArchive == false) {
-                    reject({
-                        error: "Backup archive file is invalid or empty; check for errors above",
-                    });
-                    return;
-                }
+const runCommand = async (
+    command: string,
+    args: string[],
+    options: { env?: NodeJS.ProcessEnv; captureStdout?: boolean } = {},
+) =>
+    new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+        const child = spawn(command, args, {
+            env: options.env ?? process.env,
+            stdio: ["ignore", options.captureStdout ? "pipe" : "ignore", "pipe"],
+        });
+        let stdout = "";
+        let stderr = "";
+        const captureLimit = 20_000;
+        const capture = (current: string, chunk: string) =>
+            (current + chunk).slice(Math.max(0, current.length + chunk.length - captureLimit));
 
-                // not all text in stderr will be a critical error, print the error / warning
-                if (stderr != "") {
-                    console.log({ stderr: stderr.trimEnd() });
-                }
-
-                console.log("Backup archive file is valid");
-                console.log("Backup filesize:", filesize(statSync(filePath).size));
-
-                // if stderr contains text, let the user know that it was potently just a warning message
-                if (stderr != "") {
-                    console.log(
-                        `Potential warnings detected; Please ensure the backup file "${path.basename(filePath)}" contains all needed data`,
-                    );
-                }
-
-                resolve(undefined);
-            },
-        );
+        child.stdout?.setEncoding("utf8");
+        child.stderr.setEncoding("utf8");
+        child.stdout?.on("data", (chunk: string) => {
+            stdout = capture(stdout, chunk);
+        });
+        child.stderr.on("data", (chunk: string) => {
+            stderr = capture(stderr, chunk);
+        });
+        child.once("error", reject);
+        child.once("close", (code, signal) => {
+            if (code === 0) {
+                resolve({ stdout, stderr });
+                return;
+            }
+            const detail = stderr.trimEnd() || "No error output was produced.";
+            reject(
+                new Error(
+                    `${command} failed with exit code ${code}${signal ? ` (signal ${signal})` : ""}: ${detail}`,
+                ),
+            );
+        });
     });
 
-    console.log("DB dumped to file...");
+const parseBackupOptions = (value: string): string[] => {
+    const args: string[] = [];
+    let current = "";
+    let quote: "'" | '"' | undefined;
+    let escaping = false;
+
+    const push = () => {
+        if (current) args.push(current);
+        current = "";
+    };
+
+    for (const character of value.trim()) {
+        if (escaping) {
+            current += character;
+            escaping = false;
+        } else if (character === "\\" && quote !== "'") {
+            escaping = true;
+        } else if (quote) {
+            if (character === quote) quote = undefined;
+            else current += character;
+        } else if (character === "'" || character === '"') {
+            quote = character;
+        } else if (/\s/.test(character)) {
+            push();
+        } else {
+            current += character;
+        }
+    }
+
+    if (escaping || quote)
+        throw new Error("BACKUP_OPTIONS contains an unfinished quote or escape.");
+    push();
+
+    const controlledOptions = ["--dbname", "--file", "--format", "--compress"];
+    for (const arg of args) {
+        const isControlledLongOption = controlledOptions.some(
+            (option) => arg === option || arg.startsWith(`${option}=`),
+        );
+        const isControlledShortOption =
+            !arg.startsWith("--") &&
+            (arg.startsWith("-d") ||
+                arg.startsWith("-f") ||
+                arg.startsWith("-F") ||
+                arg.startsWith("-Z"));
+        if (isControlledLongOption || isControlledShortOption) {
+            throw new Error(
+                `BACKUP_OPTIONS cannot override the database, output file, archive format, or compression: ${arg}`,
+            );
+        }
+    }
+
+    return args;
 };
 
-const deleteFile = async (path: string) => {
-    console.log("Deleting file...");
-    await new Promise((resolve, reject) => {
-        unlink(path, (err) => {
-            reject({ error: err });
+const removeIfPresent = (filePath: string) => rm(filePath, { force: true });
+
+const dumpAttempt = async (filePath: string) => {
+    await removeIfPresent(filePath);
+
+    console.log("Checking database readiness...");
+    await runCommand("pg_isready", ["--timeout=10"], { env: connectionEnv() });
+
+    console.log("Dumping DB to file...");
+    await runCommand(
+        "pg_dump",
+        [
+            ...parseBackupOptions(env.BACKUP_OPTIONS),
+            "--format=custom",
+            `--compress=${env.BACKUP_COMPRESSION}`,
+            `--file=${filePath}`,
+        ],
+        { env: connectionEnv() },
+    );
+
+    console.log("Validating backup archive...");
+    await runCommand("pg_restore", ["--list", filePath]);
+
+    if (statSync(filePath).size === 0) {
+        throw new Error("Backup archive is empty.");
+    }
+
+    console.log("Backup archive is valid");
+    console.log("Backup filesize:", filesize(statSync(filePath).size));
+};
+
+const dumpToFile = async (filePath: string) => {
+    const maxAttempts = 3;
+    const baseDelayMilliseconds = 5_000;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        try {
+            await dumpAttempt(filePath);
+            console.log("DB dumped to file...");
             return;
-        });
-        resolve(undefined);
-    });
+        } catch (error) {
+            await removeIfPresent(filePath);
+            const message = error instanceof Error ? error.message : String(error);
+            console.error(`Backup attempt ${attempt}/${maxAttempts} failed: ${message}`);
+
+            if (attempt === maxAttempts) throw error;
+
+            const delay = baseDelayMilliseconds * 2 ** (attempt - 1);
+            console.log(`Retrying backup in ${delay / 1000} seconds...`);
+            await sleep(delay);
+        }
+    }
 };
 
 export const backup = async (): Promise<{ filename: string; size: number }> => {
@@ -178,14 +282,18 @@ export const backup = async (): Promise<{ filename: string; size: number }> => {
 
     const date = new Date().toISOString();
     const timestamp = date.replace(/[:.]+/g, "-");
-    const filename = `${env.BACKUP_FILE_PREFIX}-${timestamp}.tar.gz`;
+    const filename = `${env.BACKUP_FILE_PREFIX}-${timestamp}.dump`;
     const filepath = path.join(os.tmpdir(), filename);
 
-    await dumpToFile(filepath);
-    const size = statSync(filepath).size;
-    await uploadToS3({ name: filename, path: filepath });
-    await deleteFile(filepath);
+    try {
+        await dumpToFile(filepath);
+        const size = statSync(filepath).size;
+        await uploadToS3({ name: filename, path: filepath });
 
-    console.log("DB backup complete...");
-    return { filename, size };
+        console.log("DB backup complete...");
+        return { filename, size };
+    } finally {
+        console.log("Deleting temporary files...");
+        await removeIfPresent(filepath);
+    }
 };

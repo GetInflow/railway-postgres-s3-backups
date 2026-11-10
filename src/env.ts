@@ -37,14 +37,13 @@ export const env = envsafe({
         default: "",
         allowEmpty: true,
     }),
+    BACKUP_COMPRESSION: str({
+        desc: "Compression method and level for the PostgreSQL custom-format archive.",
+        default: "gzip:6",
+    }),
     MAX_BACKUPS: num({
         desc: "Maximum number of backups to keep in S3. Oldest backups are deleted when exceeded. 0 = unlimited.",
         default: 10,
-        allowEmpty: true,
-    }),
-    DISCORD_WEBHOOK_URL: str({
-        desc: "Optional Discord webhook URL for backup success/failure notifications.",
-        default: "",
         allowEmpty: true,
     }),
 });
