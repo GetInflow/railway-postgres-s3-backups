@@ -1,14 +1,12 @@
 import {
-    GetObjectCommand,
     HeadObjectCommand,
     ListObjectsV2Command,
     S3Client,
     S3ClientConfig,
 } from "@aws-sdk/client-s3";
-import { spawn } from "child_process";
-import { createGunzip } from "zlib";
-import { pipeline } from "stream/promises";
-import { Readable } from "stream";
+import { ChildProcess, spawn } from "child_process";
+import { mkdir, open, rename, rm, stat, statfs, writeFile } from "fs/promises";
+import { join } from "path";
 import { filesize } from "filesize";
 
 import { restoreEnv as env } from "./restore-env.js";
@@ -21,6 +19,33 @@ type BackupObject = {
     size?: number;
     lastModified?: Date;
 };
+
+type ProcessResult = {
+    code: number | null;
+    signal: NodeJS.Signals | null;
+    stdout: string;
+    stderr: string;
+};
+
+type LocalBackup = {
+    archivePath: string;
+    restorePath: string;
+    cleanupPaths: string[];
+};
+
+const captureLimit = 20_000;
+let activeChild: ChildProcess | undefined;
+let receivedSignal: NodeJS.Signals | undefined;
+
+const capture = (current: string, chunk: string) =>
+    (current + chunk).slice(Math.max(0, current.length + chunk.length - captureLimit));
+
+const elapsed = (startedAt: number) => `${Math.round((Date.now() - startedAt) / 1000)}s`;
+
+const memoryUsage = () => filesize(process.memoryUsage().rss);
+
+const sleep = (milliseconds: number) =>
+    new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
 
 const createS3Client = () => {
     const clientOptions: S3ClientConfig = {
@@ -73,15 +98,29 @@ const quoteQualifiedIdentifier = (identifier: string) => {
         .join(".");
 };
 
-const command = async (
+const throwIfTerminationRequested = () => {
+    if (receivedSignal) {
+        throw new Error(`Restore interrupted by ${receivedSignal}.`);
+    }
+};
+
+const runProcess = async (
     name: string,
     args: string[],
-    options: { input?: string; inheritOutput?: boolean } = {},
-): Promise<string> => {
+    options: {
+        env?: NodeJS.ProcessEnv;
+        inheritOutput?: boolean;
+        heartbeat?: () => void | Promise<void>;
+        heartbeatIntervalMs?: number;
+    } = {},
+): Promise<ProcessResult> => {
+    throwIfTerminationRequested();
+
     const child = spawn(name, args, {
-        stdio: [options.input ? "pipe" : "ignore", "pipe", "pipe"],
-        env: process.env,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: options.env ?? process.env,
     });
+    activeChild = child;
 
     let stdout = "";
     let stderr = "";
@@ -90,35 +129,59 @@ const command = async (
     child.stderr.setEncoding("utf8");
 
     child.stdout.on("data", (chunk: string) => {
-        stdout += chunk;
+        stdout = capture(stdout, chunk);
         if (options.inheritOutput) process.stdout.write(chunk);
     });
     child.stderr.on("data", (chunk: string) => {
-        stderr += chunk;
+        stderr = capture(stderr, chunk);
         if (options.inheritOutput) process.stderr.write(chunk);
     });
 
-    if (options.input && child.stdin) {
-        child.stdin.end(options.input);
-    }
+    const heartbeat =
+        options.heartbeat &&
+        setInterval(() => {
+            void Promise.resolve(options.heartbeat?.()).catch((error) => {
+                console.warn(`Progress check failed: ${String(error)}`);
+            });
+        }, options.heartbeatIntervalMs ?? 30_000);
+    heartbeat?.unref();
 
-    const exitCode = await new Promise<number | null>((resolve, reject) => {
-        child.once("error", reject);
-        child.once("close", resolve);
+    const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+        (resolve, reject) => {
+            child.once("error", reject);
+            child.once("close", (code, signal) => resolve({ code, signal }));
+        },
+    ).finally(() => {
+        if (heartbeat) clearInterval(heartbeat);
+        if (activeChild === child) activeChild = undefined;
     });
 
-    if (exitCode !== 0) {
-        const safeArgs = args.map((arg) => {
+    return {
+        ...exit,
+        stdout: stdout.trimEnd(),
+        stderr: stderr.trimEnd(),
+    };
+};
+
+const safeCommand = (name: string, args: string[]) =>
+    `${name} ${args
+        .map((arg) => {
             if (arg === env.TARGET_DATABASE_URL) return "***";
             if (arg.startsWith("--dbname=")) return "--dbname=***";
             return arg;
-        });
+        })
+        .join(" ")}`;
+
+const command = async (name: string, args: string[]): Promise<string> => {
+    const result = await runProcess(name, args);
+
+    if (result.code !== 0) {
         throw new Error(
-            `${name} ${safeArgs.join(" ")} failed with exit code ${exitCode}${stderr ? `: ${stderr.trimEnd()}` : ""}`,
+            `${safeCommand(name, args)} failed with exit code ${result.code}${result.signal ? ` signal ${result.signal}` : ""}${result.stderr ? `: ${result.stderr}` : ""}`,
         );
     }
 
-    return stdout.trimEnd();
+    return result.stdout || result.stderr;
 };
 
 const psql = (args: string[]) => command("psql", [env.TARGET_DATABASE_URL, ...args]);
@@ -231,32 +294,205 @@ const createExtensions = async () => {
     }
 };
 
-const toReadable = (body: unknown): Readable => {
-    if (body instanceof Readable) return body;
-
-    if (body && typeof body === "object" && Symbol.asyncIterator in body) {
-        return Readable.from(body as AsyncIterable<Uint8Array>);
+const assertRestoreSettings = () => {
+    for (const [name, value] of [
+        ["RESTORE_DOWNLOAD_ATTEMPTS", env.RESTORE_DOWNLOAD_ATTEMPTS],
+        ["RESTORE_JOBS", env.RESTORE_JOBS],
+    ] as const) {
+        if (!Number.isInteger(value) || value < 1) {
+            throw new Error(`${name} must be a positive integer.`);
+        }
     }
-
-    if (body && typeof body === "object" && "transformToWebStream" in body) {
-        const webStream = (
-            body as { transformToWebStream: () => ReadableStream<Uint8Array> }
-        ).transformToWebStream();
-        return Readable.fromWeb(webStream);
-    }
-
-    throw new Error("S3 object body is not a readable stream.");
 };
 
-const restoreFromS3 = async (client: S3Client, backup: BackupObject) => {
-    console.log(`\nRestoring from s3://${env.S3_BUCKET}/${backup.key}`);
+const prepareWorkDirectory = async (backup: BackupObject) => {
+    await mkdir(env.RESTORE_WORK_DIR, { recursive: true });
+
+    if (backup.size === undefined) return;
+
+    const filesystem = await statfs(env.RESTORE_WORK_DIR);
+    const available = Number(filesystem.bavail) * Number(filesystem.bsize);
+    const required = backup.size + 256 * 1024 * 1024;
+    console.log(`Restore workspace: ${env.RESTORE_WORK_DIR} (${filesize(available)} available)`);
+
+    if (available < required) {
+        throw new Error(
+            `Insufficient restore workspace: ${filesize(available)} available, at least ${filesize(required)} required for this archive.`,
+        );
+    }
+};
+
+const awsEnvironment = (configPath?: string): NodeJS.ProcessEnv => ({
+    ...process.env,
+    AWS_ACCESS_KEY_ID: env.S3_ACCESS_KEY,
+    AWS_SECRET_ACCESS_KEY: env.S3_SECRET_KEY,
+    AWS_DEFAULT_REGION: env.S3_REGION,
+    AWS_RETRY_MODE: "standard",
+    AWS_MAX_ATTEMPTS: "5",
+    AWS_PAGER: "",
+    AWS_EC2_METADATA_DISABLED: "true",
+    ...(configPath ? { AWS_CONFIG_FILE: configPath } : {}),
+});
+
+const restoreCleanupPaths = () => [
+    join(env.RESTORE_WORK_DIR, "selected-backup.dump.part"),
+    join(env.RESTORE_WORK_DIR, "selected-backup.dump"),
+    join(env.RESTORE_WORK_DIR, "selected-backup.tar.gz.part"),
+    join(env.RESTORE_WORK_DIR, "selected-backup.tar.gz"),
+    join(env.RESTORE_WORK_DIR, "selected-backup.tar"),
+    join(env.RESTORE_WORK_DIR, "aws-config"),
+];
+
+const downloadBackup = async (backup: BackupObject): Promise<LocalBackup> => {
+    assertRestoreSettings();
+    await prepareWorkDirectory(backup);
+
+    const archiveName =
+        backup.format === "custom" ? "selected-backup.dump" : "selected-backup.tar.gz";
+    const archivePath = join(env.RESTORE_WORK_DIR, archiveName);
+    const partialPath = `${archivePath}.part`;
+    const legacyTarPath = join(env.RESTORE_WORK_DIR, "selected-backup.tar");
+    const configPath = join(env.RESTORE_WORK_DIR, "aws-config");
+    const cleanupPaths = restoreCleanupPaths();
+
+    await Promise.all(cleanupPaths.map((path) => rm(path, { force: true })));
+
+    if (env.S3_FORCE_PATH_STYLE) {
+        await writeFile(configPath, "[default]\ns3 =\n    addressing_style = path\n", {
+            mode: 0o600,
+        });
+    }
+
+    const source = `s3://${env.S3_BUCKET}/${backup.key}`;
+    const args = ["s3", "cp", source, partialPath, "--no-progress", "--only-show-errors"];
+    if (env.S3_ENDPOINT) args.push("--endpoint-url", env.S3_ENDPOINT);
+
+    console.log(`\nDownloading ${source} to ${archivePath}`);
     const startedAt = Date.now();
+    let lastError = "";
 
-    const object = await client.send(
-        new GetObjectCommand({ Bucket: env.S3_BUCKET, Key: backup.key }),
+    for (let attempt = 1; attempt <= env.RESTORE_DOWNLOAD_ATTEMPTS; attempt += 1) {
+        await rm(partialPath, { force: true });
+        console.log(`Download attempt ${attempt}/${env.RESTORE_DOWNLOAD_ATTEMPTS}`);
+
+        const result = await runProcess("aws", args, {
+            env: awsEnvironment(env.S3_FORCE_PATH_STYLE ? configPath : undefined),
+            inheritOutput: true,
+            heartbeatIntervalMs: 15_000,
+            heartbeat: async () => {
+                try {
+                    const downloaded = (await stat(partialPath)).size;
+                    const percentage =
+                        backup.size && backup.size > 0
+                            ? ` (${Math.min(100, (downloaded / backup.size) * 100).toFixed(1)}%)`
+                            : "";
+                    console.log(
+                        `Download progress: ${filesize(downloaded)}${percentage}, elapsed ${elapsed(startedAt)}, runner RSS ${memoryUsage()}`,
+                    );
+                } catch (error) {
+                    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+                }
+            },
+        });
+
+        throwIfTerminationRequested();
+
+        if (result.code === 0) {
+            lastError = "";
+            break;
+        }
+
+        lastError = `aws s3 cp failed with exit code ${result.code}${result.signal ? ` signal ${result.signal}` : ""}${result.stderr ? `: ${result.stderr}` : ""}`;
+        if (attempt < env.RESTORE_DOWNLOAD_ATTEMPTS) {
+            const delaySeconds = 5 * 2 ** (attempt - 1);
+            console.warn(`${lastError}\nRetrying download in ${delaySeconds}s.`);
+            await sleep(delaySeconds * 1000);
+        }
+    }
+
+    if (lastError) throw new Error(lastError);
+
+    const downloadedSize = (await stat(partialPath)).size;
+    if (backup.size !== undefined && downloadedSize !== backup.size) {
+        throw new Error(
+            `Downloaded size mismatch: expected ${backup.size} bytes, received ${downloadedSize} bytes.`,
+        );
+    }
+
+    await rename(partialPath, archivePath);
+    console.log(
+        `Download completed: ${filesize(downloadedSize)} in ${elapsed(startedAt)}; runner RSS ${memoryUsage()}.`,
     );
-    const body = toReadable(object.Body);
 
+    let restorePath = archivePath;
+    if (backup.format === "legacy-tar-gzip") {
+        restorePath = legacyTarPath;
+        console.log(`Decompressing legacy archive to ${restorePath}`);
+        await decompressLegacyArchive(archivePath, restorePath);
+    }
+
+    console.log("Validating downloaded archive with pg_restore --list...");
+    await command("pg_restore", ["--list", restorePath]);
+    console.log("Archive validation completed.");
+
+    return { archivePath, restorePath, cleanupPaths };
+};
+
+const decompressLegacyArchive = async (archivePath: string, outputPath: string) => {
+    const startedAt = Date.now();
+    const output = await open(outputPath, "w");
+    let child: ChildProcess | undefined;
+    let stderr = "";
+    const heartbeat = setInterval(() => {
+        void stat(outputPath)
+            .then((file) => {
+                console.log(
+                    `Legacy decompression progress: ${filesize(file.size)}, elapsed ${elapsed(startedAt)}, runner RSS ${memoryUsage()}.`,
+                );
+            })
+            .catch((error) => {
+                console.warn(`Legacy decompression progress check failed: ${String(error)}`);
+            });
+    }, 15_000);
+    heartbeat.unref();
+
+    try {
+        child = spawn("gzip", ["-dc", archivePath], {
+            stdio: ["ignore", output.fd, "pipe"],
+            env: process.env,
+        });
+        activeChild = child;
+        child.stderr?.setEncoding("utf8");
+        child.stderr?.on("data", (chunk: string) => {
+            stderr = capture(stderr, chunk);
+            process.stderr.write(chunk);
+        });
+
+        const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+            (resolve, reject) => {
+                child?.once("error", reject);
+                child?.once("close", (code, signal) => resolve({ code, signal }));
+            },
+        );
+
+        if (result.code !== 0) {
+            throw new Error(
+                `gzip failed with exit code ${result.code}${result.signal ? ` signal ${result.signal}` : ""}${stderr ? `: ${stderr.trimEnd()}` : ""}`,
+            );
+        }
+    } finally {
+        clearInterval(heartbeat);
+        if (child && activeChild === child) activeChild = undefined;
+        await output.close();
+    }
+
+    console.log(
+        `Legacy decompression completed in ${elapsed(startedAt)} (${filesize((await stat(outputPath)).size)}).`,
+    );
+};
+
+const restoreFromFile = async (backup: BackupObject, local: LocalBackup) => {
+    const startedAt = Date.now();
     const pgRestoreFormat = backup.format === "custom" ? "custom" : "tar";
     const args = [
         "--exit-on-error",
@@ -266,81 +502,42 @@ const restoreFromS3 = async (client: S3Client, backup: BackupObject) => {
         "--no-privileges",
     ];
 
-    console.log(
-        `Running: pg_restore ${args.map((arg) => (arg.startsWith("--dbname=") ? "--dbname=***" : arg)).join(" ")}`,
-    );
-
-    const pgRestore = spawn("pg_restore", args, {
-        stdio: ["pipe", "pipe", "pipe"],
-        env: process.env,
-    });
-
-    let restoreStdout = "";
-    let restoreStderr = "";
-    const captureLimit = 20_000;
-    const capture = (current: string, chunk: string) =>
-        (current + chunk).slice(Math.max(0, current.length + chunk.length - captureLimit));
-
-    pgRestore.stdout.setEncoding("utf8");
-    pgRestore.stderr.setEncoding("utf8");
-    pgRestore.stdout.on("data", (chunk: string) => {
-        restoreStdout = capture(restoreStdout, chunk);
-        process.stdout.write(chunk);
-    });
-    pgRestore.stderr.on("data", (chunk: string) => {
-        restoreStderr = capture(restoreStderr, chunk);
-        process.stderr.write(chunk);
-    });
-
-    const restoreExit = new Promise<{ code: number | null; signal: string | null }>(
-        (resolve, reject) => {
-            pgRestore.once("error", reject);
-            pgRestore.once("close", (code, signal) => resolve({ code, signal }));
-        },
-    );
-
-    let streamError: unknown;
-    try {
-        if (backup.format === "custom") {
-            await pipeline(body, pgRestore.stdin);
-        } else {
-            await pipeline(body, createGunzip(), pgRestore.stdin);
-        }
-    } catch (error) {
-        streamError = error;
-        if ((error as { code?: string }).code !== "EPIPE") {
-            pgRestore.kill();
-        }
+    if (backup.format === "custom" && env.RESTORE_JOBS > 1) {
+        args.push(`--jobs=${env.RESTORE_JOBS}`);
     }
+    args.push(local.restorePath);
 
-    const exit = await restoreExit;
+    console.log(`\nRestoring local archive: ${local.restorePath}`);
+    console.log(`Running: ${safeCommand("pg_restore", args)}`);
 
-    if (exit.code !== 0) {
-        const streamMessage =
-            streamError instanceof Error ? `\nStream error: ${streamError.message}` : "";
-        const stderrMessage = restoreStderr.trimEnd()
-            ? `\npg_restore stderr:\n${restoreStderr.trimEnd()}`
-            : "";
-        const stdoutMessage = restoreStdout.trimEnd()
-            ? `\npg_restore stdout:\n${restoreStdout.trimEnd()}`
-            : "";
+    const result = await runProcess("pg_restore", args, {
+        inheritOutput: true,
+        heartbeatIntervalMs: 30_000,
+        heartbeat: () => {
+            console.log(
+                `Restore still running: elapsed ${elapsed(startedAt)}, runner RSS ${memoryUsage()}.`,
+            );
+        },
+    });
+
+    if (result.code !== 0) {
         throw new Error(
-            `pg_restore failed with exit code ${exit.code}${exit.signal ? ` signal ${exit.signal}` : ""}.${streamMessage}${stderrMessage}${stdoutMessage}`,
+            `pg_restore failed with exit code ${result.code}${result.signal ? ` signal ${result.signal}` : ""}${result.stderr ? `\npg_restore stderr:\n${result.stderr}` : ""}${result.stdout ? `\npg_restore stdout:\n${result.stdout}` : ""}`,
         );
     }
 
-    if (streamError) {
-        if ((streamError as { code?: string }).code === "EPIPE") {
-            console.warn(
-                "Restore stream ended with EPIPE after pg_restore exited successfully; treating it as success.",
-            );
-        } else {
-            throw streamError;
-        }
-    }
+    console.log(`Restore completed in ${elapsed(startedAt)}; runner RSS ${memoryUsage()}.`);
+};
 
-    const elapsedSeconds = Math.round((Date.now() - startedAt) / 1000);
-    console.log(`Restore completed in ${elapsedSeconds}s.`);
+const cleanupLocalBackup = async (local: LocalBackup | undefined) => {
+    console.log("Deleting local restore files...");
+    const results = await Promise.allSettled(
+        (local?.cleanupPaths ?? restoreCleanupPaths()).map((path) => rm(path, { force: true })),
+    );
+    const failures = results.filter((result) => result.status === "rejected");
+    if (failures.length > 0) {
+        console.warn(`Failed to delete ${failures.length} local restore file(s).`);
+    }
 };
 
 const preflight = async (backup: BackupObject) => {
@@ -355,6 +552,7 @@ const preflight = async (backup: BackupObject) => {
     console.log("\nClient versions");
     console.log(await command("pg_restore", ["--version"]));
     console.log(await command("psql", ["--version"]));
+    console.log(await command("aws", ["--version"]));
 
     await psqlPrint("Target database", "select current_database(), current_user, version();");
     await psqlPrint(
@@ -387,27 +585,52 @@ const verify = async () => {
 
 const main = async () => {
     console.log("Running restore service...");
+    assertRestoreSettings();
 
     const client = createS3Client();
-    const backup = await selectBackup(client);
+    let local: LocalBackup | undefined;
 
-    await preflight(backup);
+    try {
+        const backup = await selectBackup(client);
 
-    if (env.RESTORE_PLAN_ONLY) {
-        console.log(
-            "RESTORE_PLAN_ONLY=true, exiting before creating extensions or restoring data.",
-        );
-        return;
+        await preflight(backup);
+
+        if (env.RESTORE_PLAN_ONLY) {
+            console.log(
+                "RESTORE_PLAN_ONLY=true, exiting before downloading or modifying the target database.",
+            );
+            return;
+        }
+
+        try {
+            local = await downloadBackup(backup);
+            await createExtensions();
+            await restoreFromFile(backup, local);
+            await verify();
+        } finally {
+            await cleanupLocalBackup(local);
+        }
+    } finally {
+        client.destroy();
     }
-
-    await createExtensions();
-    await restoreFromS3(client, backup);
-    await verify();
 };
+
+const handleSignal = (signal: NodeJS.Signals) => {
+    if (receivedSignal) return;
+    receivedSignal = signal;
+    process.exitCode = signal === "SIGINT" ? 130 : 143;
+    console.error(
+        `Received ${signal}; stopping${activeChild ? ` active child process ${activeChild.pid ?? ""}` : " restore"}...`,
+    );
+    activeChild?.kill(signal);
+};
+
+process.once("SIGINT", () => handleSignal("SIGINT"));
+process.once("SIGTERM", () => handleSignal("SIGTERM"));
 
 try {
     await main();
 } catch (error) {
     console.error("Error while running restore:", error);
-    process.exit(1);
+    if (!process.exitCode) process.exitCode = 1;
 }

@@ -1,4 +1,4 @@
-import { bool, envsafe, str } from "envsafe";
+import { bool, envsafe, num, str } from "envsafe";
 
 export const restoreEnv = envsafe({
     S3_ACCESS_KEY: str(),
@@ -61,5 +61,17 @@ export const restoreEnv = envsafe({
     RESTORE_PLAN_ONLY: bool({
         desc: "Print selected backup and target preflight, then exit without changing the database.",
         default: false,
+    }),
+    RESTORE_WORK_DIR: str({
+        desc: "Local directory used to download and validate a backup before restoring it.",
+        default: "/restore-cache",
+    }),
+    RESTORE_DOWNLOAD_ATTEMPTS: num({
+        desc: "Maximum number of complete S3 download attempts.",
+        default: 3,
+    }),
+    RESTORE_JOBS: num({
+        desc: "Number of parallel pg_restore jobs for custom-format archives. Keep at 1 unless deliberately increasing target load.",
+        default: 1,
     }),
 });

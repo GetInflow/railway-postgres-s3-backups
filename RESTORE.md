@@ -8,7 +8,7 @@ The backup service writes directly compressed PostgreSQL custom-format archives:
 backup-YYYY-MM-DDTHH-MM-SS-sssZ.dump
 ```
 
-The restore service streams the selected S3 object directly into `pg_restore` and restores it into a fresh PostgreSQL database. Legacy gzip-compressed `.tar.gz` backups remain supported during migration.
+The restore service downloads the selected S3 object to local restore-runner storage, validates it, and then restores it into a fresh PostgreSQL database. Keeping the S3 transfer separate from `pg_restore` prevents a network or download failure from modifying the target database. Legacy gzip-compressed `.tar.gz` backups remain supported during migration.
 
 ## Recommended Railway setup
 
@@ -22,6 +22,7 @@ Use the same repository with two Railway services:
     - no cron schedule
     - manually triggered only
     - custom start command: `bun run restore`
+    - dedicated volume mounted at `/restore-cache`
 
 Create a new/fresh Railway Postgres instance in the desired region, then point the restore service at that database with `TARGET_DATABASE_URL`.
 
@@ -43,6 +44,7 @@ S3_REGION=...
 TARGET_DATABASE_URL=...
 RESTORE_ENABLED=true
 RESTORE_CONFIRM_TARGET_IS_DISPOSABLE=true
+RESTORE_WORK_DIR=/restore-cache
 ```
 
 If using Cloudflare R2, MinIO, Backblaze, etc. also configure the same S3 settings as the backup service:
@@ -96,6 +98,32 @@ Disable the empty-target check only for advanced/manual recovery work:
 RESTORE_REQUIRE_EMPTY=false
 ```
 
+Configure complete-download retries (default `3`):
+
+```env
+RESTORE_DOWNLOAD_ATTEMPTS=3
+```
+
+Custom-format archives can optionally use parallel restore jobs:
+
+```env
+RESTORE_JOBS=1
+```
+
+Keep `RESTORE_JOBS=1` for the first production-sized restore test. Every additional job increases concurrency, database connections, and target load.
+
+## Restore-runner storage
+
+Mount a dedicated Railway volume on the restore runner at `/restore-cache`. This is separate from the volume attached to the disposable PostgreSQL service.
+
+Allow enough space for the largest compressed backup plus operating margin:
+
+- current 4.91 GB archive: at least 10–15 GB
+- archives approaching 10 GB: at least 20 GB
+- legacy `.tar.gz` archives: enough for both the compressed archive and decompressed `.tar`
+
+The service checks free space against the compressed S3 object before downloading. It also removes stale restore files before a new download and cleans up local files after success or failure.
+
 ## Manual trigger flow
 
 1. Create a fresh Railway Postgres database in the target region.
@@ -107,7 +135,8 @@ RESTORE_REQUIRE_EMPTY=false
     ```
 
 4. Set the required restore environment variables.
-5. Optionally run once with:
+5. Attach the restore-runner volume and set `RESTORE_WORK_DIR` to its mount path.
+6. Optionally run once with:
 
     ```env
     RESTORE_PLAN_ONLY=true
@@ -115,12 +144,15 @@ RESTORE_REQUIRE_EMPTY=false
 
     to verify the selected backup and target.
 
-6. Remove `RESTORE_PLAN_ONLY` or set it to `false`.
-7. Manually deploy/run the restore service.
-8. Check logs for:
+7. Remove `RESTORE_PLAN_ONLY` or set it to `false`.
+8. Manually deploy/run the restore service.
+9. Check logs for:
     - selected S3 backup key
     - target DB version/user
     - target table count before restore
+    - download attempts and percentage
+    - archive size and validation
+    - periodic restore heartbeat and runner memory
     - `pg_restore` completion
     - verification summary
 
@@ -138,8 +170,23 @@ pg_restore \
   backup.dump
 ```
 
-The service streams from S3 rather than downloading the full backup to local disk. For legacy backups it retains the previous `gzip -dc backup.tar.gz | pg_restore --format=tar ...` path.
+The service performs these stages:
+
+1. Select the exact or latest backup with the S3 API.
+2. Run target safety checks.
+3. Download with `aws s3 cp` to a `.part` file.
+4. Check the local size against S3 metadata and atomically rename the completed file.
+5. Validate it with `pg_restore --list`.
+6. Create configured extensions.
+7. Restore from the local file and verify the target.
+8. Delete local restore files.
+
+AWS CLI runs as a child process, so Bun does not relay the multi-gigabyte backup into `pg_restore`. AWS request retries use standard mode with five attempts, and the complete download is retried according to `RESTORE_DOWNLOAD_ATTEMPTS`.
+
+Legacy `.tar.gz` archives are downloaded and decompressed to a local `.tar` before validation and restore.
 
 ## Performance note
 
-Custom format supports `pg_restore --jobs=N`, but PostgreSQL requires the input to be a regular file rather than a stream. The current restore service remains single-threaded to avoid storing the archive locally. If recovery speed becomes more important, download the compressed `.dump` to temporary disk and pass that file to `pg_restore --jobs=N`.
+Custom format supports `pg_restore --jobs=N` because the downloaded archive is a regular seekable file. The default remains one job to minimize database connections and resource use. Increase `RESTORE_JOBS` only after observing the disposable target's CPU, memory, disk, WAL, and connection usage.
+
+Restore percentage is available during the download. PostgreSQL does not expose a reliable overall percentage during `pg_restore`, so that stage emits elapsed-time and runner-memory heartbeats instead.
