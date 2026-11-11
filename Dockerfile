@@ -16,7 +16,7 @@ FROM postgres:${PG_VERSION}-alpine
 
 WORKDIR /app
 
-RUN apk add --no-cache ca-certificates libstdc++
+RUN apk add --no-cache aws-cli ca-certificates libstdc++
 
 COPY --from=bun /usr/local/bin/bun /usr/local/bin/bun
 COPY --from=build /app/node_modules ./node_modules

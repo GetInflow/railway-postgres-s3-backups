@@ -31,7 +31,7 @@ Set up Railway Cron to trigger this service on a schedule. For example, a cron e
 
 **Backup monitoring:** Progress is written to standard output and errors to standard error, which Railway captures for every cron run. The final structured events are `backup.completed` and `backup.failed`; filter by the `event` attribute in Railway's Log Explorer. A failed backup exits with status 1 and appears as failed in the service's cron-run history.
 
-**Restores:** This repo includes a separate manual restore command, `bun run restore`, intended for a second on-demand Railway service. It restores current `.dump` archives and legacy `.tar.gz` archives. Create a fresh Railway Postgres database, configure `TARGET_DATABASE_URL`, `RESTORE_ENABLED=true`, `RESTORE_CONFIRM_TARGET_IS_DISPOSABLE=true`, and either `RESTORE_S3_KEY` or `RESTORE_LATEST=true`, then trigger the restore service manually.
+**Restores:** This repo includes a separate manual restore command, `bun run restore`, intended for a second on-demand Railway service. It restores current `.dump` archives and legacy `.tar.gz` archives. Create a fresh Railway Postgres database, attach a dedicated volume to the restore runner at `/restore-cache`, configure `TARGET_DATABASE_URL`, `RESTORE_ENABLED=true`, `RESTORE_CONFIRM_TARGET_IS_DISPOSABLE=true`, and either `RESTORE_S3_KEY` or `RESTORE_LATEST=true`, then trigger the restore service manually. The runner downloads and validates the archive before modifying PostgreSQL, logs download percentage and restore heartbeats, and removes the local archive when finished.
 
 ## Why Deploy Postgres S3 Backups on Railway?
 

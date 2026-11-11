@@ -49,6 +49,12 @@ bun run restore
 
 Use it as a separate, manually triggered Railway service with `TARGET_DATABASE_URL`, `RESTORE_ENABLED=true`, `RESTORE_CONFIRM_TARGET_IS_DISPOSABLE=true`, and either `RESTORE_S3_KEY` or `RESTORE_LATEST=true`. See [RESTORE.md](./RESTORE.md) for the full restore runbook.
 
+- `RESTORE_WORK_DIR` - Local restore-runner directory used to download and validate the selected archive before the database is modified. Default `/restore-cache`; mount a dedicated Railway volume there.
+
+- `RESTORE_DOWNLOAD_ATTEMPTS` - Number of complete S3 download attempts before the restore fails. Default `3`.
+
+- `RESTORE_JOBS` - Number of parallel `pg_restore` jobs for custom-format archives. Default `1`; higher values increase database connections and target load.
+
 - `BUN_VERSION` - Specify a custom Bun version to override the default version set in the Dockerfile.
 
 - `PG_VERSION` - Specify a custom PostgreSQL version to override the default version set in the Dockerfile.
